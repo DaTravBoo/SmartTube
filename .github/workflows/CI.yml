@@ -42,7 +42,144 @@ jobs:
           echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > ${{ github.workspace }}/key.jks
     
       - name: Grant Gradle permissions
-        run: chmod +x gradlew
+        package com.liskovsoft.youtubeapi.rss
+
+import com.liskovsoft.mediaserviceinterfaces.data.MediaGroup
+import com.liskovsoft.mediaserviceinterfaces.data.MediaItem
+import com.liskovsoft.sharedutils.helpers.Helpers
+import com.liskovsoft.youtubeapi.browse.v2.BrowseService2
+import com.liskovsoft.youtubeapi.browse.v2.BrowseService2Wrapper
+import com.liskovsoft.youtubeapi.app.nsigsolver.common.YouTubeInfoExtractor
+import com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup
+import com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
+import java.util.concurrent.CopyOnWriteArrayList
+
+internal object RssService {
+    private const val RSS_URL: String = "https://www.youtube.com/feeds/videos.xml?channel_id="
+    private const val MAX_ITEMS = 100
+    private const val MAX_CONCURRENT_REQUESTS = 3
+
+    @JvmStatic
+    @JvmOverloads
+    fun getFeed(vararg channelIds: String, type: Int = -1): MediaGroup? {
+        val items = fetchFeedsSafe(channelIds.take(MAX_ITEMS)) ?: return null
+        if (items.isEmpty()) return null
+
+        items.sortByDescending { it.publishedDate }
+
+        return YouTubeMediaGroup(type).apply {
+            mediaItems = items
+        }
+    }
+
+    private fun fetchFeedsSafe(channelIds: List<String>): MutableList<MediaItem>? {
+        try {
+            return fetchFeeds(channelIds)
+        } catch (e: InterruptedException) {
+            e.printStackTrace()
+        }
+
+        return null
+    }
+
+    private fun fetchFeeds(channelIds: List<String>): MutableList<MediaItem> = runBlocking {
+        val items = CopyOnWriteArrayList<MediaItem>()
+        val semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+
+        coroutineScope {
+            for (channelId in channelIds) {
+                launch {
+                    semaphore.withPermit {
+                        fetchFeed(channelId)?.let { items.addAll(it) }
+                    }
+                }
+            }
+        }
+
+        return@runBlocking items.toMutableList()
+    }
+
+    private fun fetchFeeds2(vararg channelIds: String): MutableList<MediaItem> = runBlocking {
+        val semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+        val deferreds = channelIds.map { channelId ->
+            async {
+                semaphore.withPermit {
+                    fetchFeed(channelId)
+                }
+            }
+        }
+
+        return@runBlocking deferreds.mapNotNull { it.await() }.flatten().toMutableList()
+    }
+
+    private suspend fun fetchFeed(channelId: String): List<MediaItem>? = withContext(Dispatchers.IO) {
+        try {
+            val rssContent = YouTubeInfoExtractor.downloadWebpage(RSS_URL + channelId)
+            val result = YouTubeRssParser(Helpers.toStream(rssContent)).parse()
+            if (!result.isNullOrEmpty()) {
+                syncWithChannel(channelId, result)
+            }
+            result
+        } catch (e: Exception) {
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /**
+     * Enrich RSS items with live/duration/watched props when available,
+     * without wiping out the channel if getChannelAsGrid fails or is rate-limited.
+     */
+    private fun syncWithChannel(channelId: String, result: List<MediaItem>) {
+        try {
+            val group = getBrowseService2().getChannelAsGrid(channelId)
+            val originItems = group?.mediaItems
+            if (originItems.isNullOrEmpty()) {
+                return
+            }
+
+            // Only filter out missing items (like Shorts) if at least one regular video matched.
+            // If 0 items matched, the grid scrape failed or returned a different tab—keep all RSS items!
+            val hasAnyMatch = result.any { rssItem ->
+                originItems.any { it?.videoId == rssItem.videoId }
+            }
+
+            if (!hasAnyMatch) {
+                return
+            }
+
+            Helpers.removeIf(result) { item ->
+                val first = originItems.firstOrNull { it?.videoId == item.videoId }
+                if (first != null) {
+                    item as YouTubeMediaItem
+                    item.badgeText = first.badgeText
+                    item.isLive = first.isLive
+                    item.isUpcoming = first.isUpcoming
+                    item.videoPreviewUrl = first.videoPreviewUrl
+                    item.percentWatched = first.percentWatched
+
+                    return@removeIf false
+                }
+
+                return@removeIf true
+            }
+        } catch (e: Exception) {
+            // Keep the raw RSS items if secondary channel enrich fails
+            e.printStackTrace()
+        }
+    }
+
+    private fun getBrowseService2(): BrowseService2 = BrowseService2Wrapper
+}
+
 
       - name: Lint with Gradle
         run: ./gradlew lintStbetaRelease
