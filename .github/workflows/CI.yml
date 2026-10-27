@@ -1,255 +1,110 @@
-name: Build Debug APK
+name: Build APK
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [ master, main ]
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      HAS_SIGNING_KEY: ${{ secrets.SIGNING_KEY != '' }}
-      HAS_VT_KEY: ${{ secrets.VIRUS_TOTAL_API_KEY != '' }}
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Checkout SmartTube
+        uses: actions/checkout@v4
         with:
           submodules: recursive
 
       - name: Set up JDK 17
-        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5.2.0
+        uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-          cache: 'gradle'
+          cache: gradle
 
-      - name: Update Version Name
-        id: get_version
+      - name: Patch RssService and Build APK
         run: |
-          # Keep the original code to make the nightly and original builds interchangeable
-          sed -i "s/versionName \"\(.*\)\"/versionName \"\1-nightly-${{ github.run_number }}\"/" smarttubetv/build.gradle
-          echo "VERSION_NAME=$(grep "versionName" smarttubetv/build.gradle | head -n 1 | awk -F'"' '{print $2}')" >> $GITHUB_OUTPUT
+          chmod +x gradlew
+          TARGET_FILE=$(find . -name "RssService.kt" | head -n 1)
+          echo "Patching $TARGET_FILE"
+          cat << 'EOF' > "$TARGET_FILE"
+          package com.liskovsoft.youtubeapi.rss
 
-      - name: Configure Build Signing
-        if: ${{ env.HAS_SIGNING_KEY == 'true' }}
-        run: |
-          echo "storePassword=${{ secrets.KEY_STORE_PASSWORD }}" > keystore.properties
-          echo "keyAlias=${{ secrets.ALIAS }}" >> keystore.properties
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}" >> keystore.properties
-          echo "storeFile=${{ github.workspace }}/key.jks" >> keystore.properties
-          echo "${{ secrets.SIGNING_KEY }}" | base64 --decode > ${{ github.workspace }}/key.jks
-    
-      - name: Grant Gradle permissions
-        package com.liskovsoft.youtubeapi.rss
+          import com.liskovsoft.mediaserviceinterfaces.data.MediaGroup
+          import com.liskovsoft.mediaserviceinterfaces.data.MediaItem
+          import com.liskovsoft.sharedutils.helpers.Helpers
+          import com.liskovsoft.youtubeapi.browse.v2.BrowseService2
+          import com.liskovsoft.youtubeapi.browse.v2.BrowseService2Wrapper
+          import com.liskovsoft.youtubeapi.app.nsigsolver.common.YouTubeInfoExtractor
+          import com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup
+          import com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.async
+          import kotlinx.coroutines.coroutineScope
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.runBlocking
+          import kotlinx.coroutines.sync.Semaphore
+          import kotlinx.coroutines.sync.withPermit
+          import kotlinx.coroutines.withContext
+          import java.util.concurrent.CopyOnWriteArrayList
 
-import com.liskovsoft.mediaserviceinterfaces.data.MediaGroup
-import com.liskovsoft.mediaserviceinterfaces.data.MediaItem
-import com.liskovsoft.sharedutils.helpers.Helpers
-import com.liskovsoft.youtubeapi.browse.v2.BrowseService2
-import com.liskovsoft.youtubeapi.browse.v2.BrowseService2Wrapper
-import com.liskovsoft.youtubeapi.app.nsigsolver.common.YouTubeInfoExtractor
-import com.liskovsoft.youtubeapi.service.data.YouTubeMediaGroup
-import com.liskovsoft.youtubeapi.service.data.YouTubeMediaItem
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
-import kotlinx.coroutines.withContext
-import java.util.concurrent.CopyOnWriteArrayList
+          internal object RssService {
+              private const val RSS_URL: String = "https://www.youtube.com/feeds/videos.xml?channel_id="
+              private const val MAX_ITEMS = 100
+              private const val MAX_CONCURRENT_REQUESTS = 3
 
-internal object RssService {
-    private const val RSS_URL: String = "https://www.youtube.com/feeds/videos.xml?channel_id="
-    private const val MAX_ITEMS = 100
-    private const val MAX_CONCURRENT_REQUESTS = 3
+              @JvmStatic
+              @JvmOverloads
+              fun getFeed(vararg channelIds: String, type: Int = -1): MediaGroup? {
+                  val items = fetchFeedsSafe(channelIds.take(MAX_ITEMS)) ?: return null
+                  if (items.isEmpty()) return null
 
-    @JvmStatic
-    @JvmOverloads
-    fun getFeed(vararg channelIds: String, type: Int = -1): MediaGroup? {
-        val items = fetchFeedsSafe(channelIds.take(MAX_ITEMS)) ?: return null
-        if (items.isEmpty()) return null
+                  items.sortByDescending { it.publishedDate }
 
-        items.sortByDescending { it.publishedDate }
+                  return YouTubeMediaGroup(type).apply {
+                      mediaItems = items
+                  }
+              }
 
-        return YouTubeMediaGroup(type).apply {
-            mediaItems = items
-        }
-    }
+              private fun fetchFeedsSafe(channelIds: List<String>): MutableList<MediaItem>? {
+                  try {
+                      return fetchFeeds(channelIds)
+                  } catch (e: InterruptedException) {
+                      e.printStackTrace()
+                  }
 
-    private fun fetchFeedsSafe(channelIds: List<String>): MutableList<MediaItem>? {
-        try {
-            return fetchFeeds(channelIds)
-        } catch (e: InterruptedException) {
-            e.printStackTrace()
-        }
+                  return null
+              }
 
-        return null
-    }
+              private fun fetchFeeds(channelIds: List<String>): MutableList<MediaItem> = runBlocking {
+                  val items = CopyOnWriteArrayList<MediaItem>()
+                  val semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
 
-    private fun fetchFeeds(channelIds: List<String>): MutableList<MediaItem> = runBlocking {
-        val items = CopyOnWriteArrayList<MediaItem>()
-        val semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+                  coroutineScope {
+                      for (channelId in channelIds) {
+                          launch {
+                              semaphore.withPermit {
+                                  fetchFeed(channelId)?.let { items.addAll(it) }
+                              }
+                          }
+                      }
+                  }
 
-        coroutineScope {
-            for (channelId in channelIds) {
-                launch {
-                    semaphore.withPermit {
-                        fetchFeed(channelId)?.let { items.addAll(it) }
-                    }
-                }
-            }
-        }
+                  return@runBlocking items.toMutableList()
+              }
 
-        return@runBlocking items.toMutableList()
-    }
+              private fun fetchFeeds2(vararg channelIds: String): MutableList<MediaItem> = runBlocking {
+                  val semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
+                  val deferreds = channelIds.map { channelId ->
+                      async {
+                          semaphore.withPermit {
+                              fetchFeed(channelId)
+                          }
+                      }
+                  }
 
-    private fun fetchFeeds2(vararg channelIds: String): MutableList<MediaItem> = runBlocking {
-        val semaphore = Semaphore(MAX_CONCURRENT_REQUESTS)
-        val deferreds = channelIds.map { channelId ->
-            async {
-                semaphore.withPermit {
-                    fetchFeed(channelId)
-                }
-            }
-        }
+                  return@runBlocking deferreds.mapNotNull { it.await() }.flatten().toMutableList()
+              }
 
-        return@runBlocking deferreds.mapNotNull { it.await() }.flatten().toMutableList()
-    }
-
-    private suspend fun fetchFeed(channelId: String): List<MediaItem>? = withContext(Dispatchers.IO) {
-        try {
-            val rssContent = YouTubeInfoExtractor.downloadWebpage(RSS_URL + channelId)
-            val result = YouTubeRssParser(Helpers.toStream(rssContent)).parse()
-            if (!result.isNullOrEmpty()) {
-                syncWithChannel(channelId, result)
-            }
-            result
-        } catch (e: Exception) {
-            e.printStackTrace()
-            null
-        }
-    }
-
-    /**
-     * Enrich RSS items with live/duration/watched props when available,
-     * without wiping out the channel if getChannelAsGrid fails or is rate-limited.
-     */
-    private fun syncWithChannel(channelId: String, result: List<MediaItem>) {
-        try {
-            val group = getBrowseService2().getChannelAsGrid(channelId)
-            val originItems = group?.mediaItems
-            if (originItems.isNullOrEmpty()) {
-                return
-            }
-
-            // Only filter out missing items (like Shorts) if at least one regular video matched.
-            // If 0 items matched, the grid scrape failed or returned a different tab—keep all RSS items!
-            val hasAnyMatch = result.any { rssItem ->
-                originItems.any { it?.videoId == rssItem.videoId }
-            }
-
-            if (!hasAnyMatch) {
-                return
-            }
-
-            Helpers.removeIf(result) { item ->
-                val first = originItems.firstOrNull { it?.videoId == item.videoId }
-                if (first != null) {
-                    item as YouTubeMediaItem
-                    item.badgeText = first.badgeText
-                    item.isLive = first.isLive
-                    item.isUpcoming = first.isUpcoming
-                    item.videoPreviewUrl = first.videoPreviewUrl
-                    item.percentWatched = first.percentWatched
-
-                    return@removeIf false
-                }
-
-                return@removeIf true
-            }
-        } catch (e: Exception) {
-            // Keep the raw RSS items if secondary channel enrich fails
-            e.printStackTrace()
-        }
-    }
-
-    private fun getBrowseService2(): BrowseService2 = BrowseService2Wrapper
-}
-
-
-      - name: Lint with Gradle
-        run: ./gradlew lintStbetaRelease
-
-      - name: Upload Lint Report
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: always()
-        with:
-          name: lint-report
-          path: '**/build/reports/lint-results-*.html'
-          if-no-files-found: warn
-
-      - name: Build with Gradle
-        run: ./gradlew clean assembleStbetaRelease
-
-      - name: VirusTotal Scan
-        if: ${{ env.HAS_VT_KEY == 'true' }}
-        id: vt
-        uses: crazy-max/ghaction-virustotal@936d8c5c00afe97d3d9a1af26d017cfdf26800a2 # v5.0.0
-        with:
-          vt_api_key: ${{ secrets.VIRUS_TOTAL_API_KEY }}
-          files: |
-            ./smarttubetv/build/outputs/apk/stbeta/release/*.apk
-          request_rate: 4
-
-      - name: VirusTotal Summary
-        if: steps.vt.outcome == 'success'
-        run: |
-          echo "Waiting 150s for VirusTotal engines to report..."
-          sleep 150
-
-          echo "### Security Scan Results" >> $GITHUB_STEP_SUMMARY
-          echo "| Artifact Name | VirusTotal Status | Detailed Report |" >> $GITHUB_STEP_SUMMARY
-          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
-
-          for apk in ./smarttubetv/build/outputs/apk/stbeta/release/*.apk; do
-            filename=$(basename "$apk")
-            sha256=$(sha256sum "$apk" | awk '{print $1}')
-
-            # Construct the dynamic badge URL using the hash
-            badge_url="https://badges.cssnr.com/vt/id/$sha256?start=green&end=red&n=8"
-            vt_link="https://www.virustotal.com/gui/file/$sha256"
-
-            echo "| $filename | [![$filename]($badge_url)]($vt_link) | [View Report]($vt_link) |" >> $GITHUB_STEP_SUMMARY
-          done
-
-      - name: Upload ARM64 APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: SmartTube_${{ steps.get_version.outputs.VERSION_NAME }}_arm64
-          path: ./smarttubetv/build/outputs/apk/stbeta/release/*_arm64-v8a.apk
-          if-no-files-found: error
-
-      - name: Upload ARMv7 APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: SmartTube_${{ steps.get_version.outputs.VERSION_NAME }}_armeabi-v7a
-          path: ./smarttubetv/build/outputs/apk/stbeta/release/*_armeabi-v7a.apk
-          if-no-files-found: error
-
-      - name: Upload Universal APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: SmartTube_${{ steps.get_version.outputs.VERSION_NAME }}_universal
-          path: ./smarttubetv/build/outputs/apk/stbeta/release/*_universal.apk
-          if-no-files-found: error
-
-      - name: Upload x86 APK
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: SmartTube_${{ steps.get_version.outputs.VERSION_NAME }}_x86
-          path: ./smarttubetv/build/outputs/apk/stbeta/release/*_x86.apk
-          if-no-files-found: error
+              private suspend fun fetchFeed(channelId: String): List
+              
